@@ -14,6 +14,10 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
 
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+
 logger = logging.getLogger(__name__)
 
 class TrainerConfig:
@@ -45,15 +49,13 @@ class Trainer:
         self.config = config
 
         # take over whatever gpus are on the system
-        self.device = 'cpu'
-        if torch.cuda.is_available():
-            self.device = torch.cuda.current_device()
-            self.model = torch.nn.DataParallel(self.model).to(self.device)
+        self.device = xm.xla_device()
+        self.model = torch.nn.DataParallel(self.model).to(self.device)
 
     def save_checkpoint(self):
         # DataParallel wrappers keep raw model object in .module attribute
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        logger.info("saving %s", self.config.ckpt_path)
+        xm.master_print("saving {}".format( self.config.ckpt_path))
         torch.save(raw_model.state_dict(), self.config.ckpt_path)
 
     def train(self):
@@ -65,17 +67,13 @@ class Trainer:
             is_train = split == 'train'
             model.train(is_train)
             data = self.train_dataset if is_train else self.test_dataset
-            loader = DataLoader(data, shuffle=True, pin_memory=True,
+            loader = DataLoader(data, shuffle=True, pin_memory=False,
                                 batch_size=config.batch_size,
                                 num_workers=config.num_workers)
+            mp_device_loader = pl.MpDeviceLoader(loader, self.device)
 
             losses = []
-            pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y) in pbar:
-
-                # place data on the correct device
-                x = x.to(self.device)
-                y = y.to(self.device)
+            for it, (x, y) in enumerate(mp_device_loader):
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
@@ -89,7 +87,7 @@ class Trainer:
                     model.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                    optimizer.step()
+                    xm.optimizer_step(optimizer)
 
                     # decay the learning rate based on our progress
                     if config.lr_decay:
@@ -108,11 +106,11 @@ class Trainer:
                         lr = config.learning_rate
 
                     # report progress
-                    pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
+                    xm.master_print("epoch {} iter {}: train loss {:.5f}. lr {:e}".format(epoch+1, it,loss.item(),  lr))
 
             if not is_train:
                 test_loss = float(np.mean(losses))
-                logger.info("test loss: %f", test_loss)
+                xm.master_print("test loss: %f".format( test_loss))
                 return test_loss
 
         best_loss = float('inf')
